@@ -1,0 +1,298 @@
+---
+title: "Correction du BHB Endogène"
+author: "Version 2.0 (2021)"
+output: html_document
+---
+
+```{r import, echo = FALSE, message = FALSE, warning = FALSE}
+# Importer le package dplyr.
+library(dplyr)
+
+# Importer le contenu du presse-papier (table MQ).
+Import <- read.delim(file = "clipboard", header = TRUE, sep = "\t")
+
+# Ne conserver que les STD qui sont cochés (Used = True).
+Data <- Import %>% filter(Used == "True" & Sample.Type == "Standard")
+
+# Pour l'identification du technicien, aller chercher le contenu de la colonne "Sample Comment".
+Tech <- Data$Sample.Comment[1]
+
+# Préparer la valeur nécessaire pour vérifier si les STD0 sont cochés.
+# Conserver uniquement la colonne used pour les échantillons dont la concentration dopée est zéro.
+Verif <- Import %>% filter(Actual.Concentration == 0) %>% select(Used)
+Verif <- as.character(Verif$Used)
+# Vérifier s'il y a un "False" (non utilisé) dans cette colonne.
+V <- "False" %in% Verif
+
+```
+
+```{r, echo = FALSE, eval = V, fig.width = 6, fig.height = 1.5, message = FALSE, warning = FALSE}
+# Bloc R conditionnel (à l'aide de "eval"); n'est effectué que si V = TRUE, c'est-à-dire s'il y a un STD0 décoché.
+
+# Importer le package ggplot2.
+library(ggplot2)
+
+# Générer un avertissement visuel - un ou plusieurs STD 0 sont décochés.
+# Avertissement généré via la production d'un graph ggplot toujours identique.
+# Cette solution a été utilisée puisqu'il n'est pas possible d'afficher une image conditionnellement.
+# Par contre, c'est possible de le faire pour un graphique.
+ggplot(data = Data, mapping = (aes(x = 1, y = 1))) +
+  # Un seul point : gros losange rouge.
+  geom_point(size = 15, shape = 18, color = "red") +
+  # Texte à côté du losange rouge.
+  annotate(geom = "text", x = 1.8, y = 1, label = "Attention, STD0 décoché(s)", color = "red", size = 7) +
+  scale_x_continuous(lim = c(0.99, 3)) +
+  scale_y_continuous(lim = c(0.99, 1.01)) +
+  theme_classic() +
+  # Éliminer tous les éléments "graphiques" classiques (axes, étiquettes, etc.)
+  # pour ne laisser que le point et le texte.
+  theme(legend.position = "none",
+        axis.title.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank())
+
+```
+
+## Identification de la batch
+<!-- Afficher les identifiants de la batch dans le rapport. -->
+
+Batch : `r Batch`  
+
+Technicien(ne) : `r Tech`  
+
+<!-- Note: Sys.Date() affiche la date de l'ordinateur, donc normalement celle où le rapport est produit.  -->
+Date : `r Sys.Date()`
+
+
+## Outils diagnostiques
+<!-- Puisque l'affichage des signaux visuels dépend de l'ensemble des résultats diagnostiques, il faut d'abord effectuer l'ensemble des calculs/diagnostics en arrière-plan. -->
+
+```{r endogene, echo = FALSE, comment = NA}
+# Première étape: calcul de la concentration endogène.
+# Création des vecteurs de variables.
+X <- Data$Actual.Concentration
+
+X2 <- Data$Actual.Concentration*Data$Actual.Concentration
+
+Y <- Data$Area.Ratio
+
+# Vecteur de pondération (1/x^2 utilisé pour BHB).
+Wt <- 1/X2
+
+# Si le poids = Inf car concentration = 0, remplacer par 1/(1E-8^2) = 1E16 pour permettre le calcul.
+for(i in 1:length(Wt)){
+  if(Wt[i] == Inf){
+    Wt[i] <- 1E16
+  }
+}
+
+# Effectuer régression avec modèle quadratique et pondération 1/(x^2).
+Reg <- lm(Y ~ X + X2, weight = Wt)
+
+# Obtenir les paramètres de régression; y = B2(x^2) + B1(x) + B0.
+RegP <- summary(Reg)
+
+B0 <- RegP$coefficients[1] 
+B1 <- RegP$coefficients[2] 
+B2 <- RegP$coefficients[3]
+
+# Résoudre pour les deux abscisses à l'origine.
+Q1 <- abs((-B1 + sqrt((B1^2) - 4*B2*B0))/(2*B2))
+Q2 <- abs((-B1 - sqrt((B1^2) - 4*B2*B0))/(2*B2))
+
+# Que ce soit une parabole + ou -, la bonne solution sera toujours celle qui a la valeur absolue la plus petite.
+# C'est la concentration endogène sous le modèle quadratique.
+CE <- min(c(Q1, Q2))
+
+```
+
+```{r lineaire, echo = FALSE}
+# Concentration endogène sous le modèle linéaire.
+# Effectuer la régression avec le modèle linéaire et pondération 1/(x^2).
+RegL <- lm(Y ~ X, weight = Wt)
+
+# Obtenir les paramètres de régression; y = B1(x) + B0.
+RegP_L <- summary(RegL)
+
+B0_L <- RegP_L$coefficients[1] 
+B1_L <- RegP_L$coefficients[2] 
+
+# La concentration endogène est l'abscisse à l'origine, résoudre pour celle-ci.
+CE_L <- abs(B0_L/B1_L)
+
+# Écart (valeur absolue) entre la solution quadratique et la solution linéaire.
+Ecart <- abs(CE - CE_L)
+
+```
+
+```{r corrigee, echo = FALSE, comment = NA}
+# Concentrations et courbe corrigées pour la valeur endogène.
+# Concentration corrigée = concentration dopée + concentration endogène.
+XC <- X + CE
+
+X2C <- XC*XC
+
+# NB. Les area ratios restent les mêmes, donc le vecteur Y demeure le bon.
+
+# Vecteur pondération pour les concentrations corrigées.
+WtC <- 1/X2C
+
+# Si le poids = Inf car concentration = 0, remplacer par 1/(1E-8^2) = 1E16 pour permettre le calcul.
+# Devrait être excessivement rare pour la concentration corrigée, mais pas impossible non plus.
+for(i in 1:length(WtC)){
+  if(WtC[i] == Inf){
+    WtC[i] <- 1E16
+  }
+}
+
+# Effectuer régression avec modèle quadratique et pondération 1/(x^2).
+RegC <- lm(Y ~ XC + X2C , weight = WtC)
+
+# Obtenir les paramètres de régression; y = B2(x^2) + B1(x) + B0.
+RegP_C <- summary(RegC)
+
+B0_C <- RegP_C$coefficients[1] 
+B1_C <- RegP_C$coefficients[2] 
+B2_C <- RegP_C$coefficients[3]
+
+# Résoudre pour les deux abscisses à l'origine.
+Q1_C <- abs((-B1_C + sqrt((B1_C^2) - 4*B2_C*B0_C))/(2*B2_C))
+Q2_C <- abs((-B1_C - sqrt((B1_C^2) - 4*B2_C*B0_C))/(2*B2_C))
+
+# Que ce soit une parabole + ou -, la bonne solution sera toujours celle qui a la valeur absolue la plus petite.
+Abscisse <- min(c(Q1_C, Q2_C))
+
+```
+
+```{r signals, echo = FALSE, message = FALSE,  fig.width=6, fig.height=1.5, message = FALSE, warning = FALSE}
+# Importer le package ggplot2. Refait ici, car si le bloc pour les STD0 n'a pas été évalué, ggplot2 ne sera pas chargé.
+library(ggplot2)
+
+# Créer un ensemble de données adapté à ggplot pour afficher les signaux de couleur.
+# Encore une fois, impossible d'afficher conditionnellement des images,
+# donc je détourne ggplot pour obtenir le résultat désiré.
+sigx <- c(1, 2, 3)
+sigy <- c(1, 1, 1)
+sigcol <- c(NA, NA, NA)
+
+# Vérifier les seuils pour les 3 outils. Si le seuil est dépassé, inscrit "O" pour "orange" dans la case appropriée.
+# Outil 1: concentration endogène.
+if(CE < 20){
+  sigcol[1] <- "V"
+} else {sigcol[1] <- "O"}
+
+# Outil 2: ecart entre les solutions linéaires et quadratique.
+if(Ecart < 5){
+  sigcol[2] <- "V"
+} else {sigcol[2] <- "O"}
+
+# Outil 3: abscisse à l'origine > 5.
+if(Abscisse < 5){
+  sigcol[3] <- "V"
+} else {sigcol[3] <- "O"}
+
+# Attacher le tout dans un format lisible par ggplot.
+Signals <- as_tibble(cbind(sigx, sigy, sigcol))
+Signals$sigx <- as.numeric(Signals$sigx)
+Signals$sigy <- as.numeric(Signals$sigy)
+
+# Production du graphique par ggplot.
+ggplot(data = Signals, mapping = (aes(x = sigx, y = sigy, col = sigcol))) +
+  geom_point(size = 15) +
+  # Si "O" est indiqué dans sigcol, le point sera orange.
+  # Si "V" est indiqué dans sigcol, le point sera vert.
+  scale_color_manual(values = c("O" = "#FF8C00", "V" = "#32CD32")) +
+  scale_x_continuous(breaks = c(1,2,3)) +
+  scale_y_continuous(lim = c(0.99, 1.01)) +
+  theme_classic() +
+  # Éliminer tous les éléments "graphiques" classiques (axes, étiquettes, etc.)
+  # pour ne laisser que le point et le texte.
+  theme(legend.position = "none",
+        axis.title.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank())
+
+
+```
+
+
+<!-- Pour chacun des outils, afficher les valeurs arrondies à 2 décimales près. Puis, afficher le message "OK" ou "XYZ élevé" selon le cas. -->
+#### Outil 1 : Concentration endogène < 20
+
+Concentration endogène : `r round(CE, digits = 2)`  
+
+`r ifelse(CE < 20, "OK", "Concentration endogène élevée")`
+
+
+#### Outil 2 : Écart entre les solutions quadratique et linéaire < 5
+
+Concentration endogène - modèle quadratique : `r round(CE, digits = 2)`  
+Concentration endogène - modèle linéaire : `r round(CE_L, digits = 2)`   
+Écart : `r round(Ecart, digits = 2)`  
+
+`r ifelse(Ecart < 5, "OK", "Écart élevé entre les deux solutions")`
+
+
+#### Outil 3 : Abscisse à l'origine < 5
+
+Abscisse à l'origine : `r round(Abscisse, digits = 2)`  
+
+L'abscisse à l'origine représente le biais potentiel estimé sur les inconnus (dilués ou non). Par exemple, une abscisse à l'origine de 10 signifie un biais potentiel de +10 ug/mL sur les inconnus (surestimation).   
+
+`r ifelse(Abscisse < 5, "OK", "Abscisse à l'origine élevée")`
+
+
+## Données
+```{r display, echo = FALSE, message = FALSE, comment = NA}
+# En repartant des données initiales, sélectionner un nombre restreint de colonnes.
+# Créer une nouvelle colonne pour les concentrations corrigées (acutal + endogène).
+Display <- Import %>% select(Sample.Name, Sample.Type, Used, Area.Ratio, Actual.Concentration) %>% 
+  mutate(Corrected.Concentration = Actual.Concentration + CE)
+
+# Afficher le tableau de données.
+Display
+
+```
+
+
+```{r graph, echo = FALSE, message = FALSE}
+# Créer un ensemble de données pour afficher le modèle de régression.
+XPred <- seq(from = 0, to = 400, by = 1)
+YPred <- B2_C*XPred*XPred + B1_C*XPred + B0_C
+Regression <- as_tibble(cbind(XPred, YPred))
+
+# Générer le graphique de la courbe corrigée.
+ggplot(data = Display, mapping = aes(x = Corrected.Concentration, y = Area.Ratio)) +
+  geom_point(size = 2, aes(color = Sample.Type, shape = Used)) +
+  # StD en bleu, QC en jaune.
+  scale_color_manual(values = c("#e0ba2f", "#003299")) +
+  # Used = True sera plein, Used = False sera vide.
+  scale_shape_manual(values = c("True" = 19, "False" = 1)) +
+  # Régression théorique.
+  geom_line(data = Regression, mapping = aes(x = XPred, y = YPred)) +
+  coord_cartesian(xlim = c(0, 1.05*max(Display$Corrected.Concentration)), ylim = c(0, 1.05*max(Display$Area.Ratio))) +
+  scale_x_continuous(name = expression("Concentration (corrected, "*mu*"g/mL)"), breaks = seq(from = 0, to = 400, by = 20), expand = c(0,0)) +
+  scale_y_continuous(name = "Area Ratio", expand = c(0,0)) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+
+```
+
+
+
+```{r export, echo = FALSE}
+# Étape finale: exporter les concentrations corrigées pour coller dans MultiQuant.
+# Utilise les données de Display, qui sont complètes (STD et CQ).
+writeClipboard(as.character(Display$Corrected.Concentration))
+
+```
